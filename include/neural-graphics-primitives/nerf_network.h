@@ -101,15 +101,17 @@ public:
 	virtual ~NerfNetwork() { }
 
 	void inference_mixed_precision_impl(cudaStream_t stream, const tcnn::GPUMatrixDynamic<float>& input, tcnn::GPUMatrixDynamic<T>& output, bool use_inference_params = true) override {
-		// pipeline depth 2
-		cudaStream_t stream2; // for SW pipelining
+		// pipeline 3 stage
+		cudaStream_t stream2, stream3, stream4 /*, stream5*/; // for SW pipelining
 		cudaStreamCreate(&stream2);
+		cudaStreamCreate(&stream3);
+		cudaStreamCreate(&stream4);
+		// cudaStreamCreate(&stream5);
 		cudaDeviceSynchronize(); // for sync with previous kernels in stream
 
 		uint32_t tot_batch_size = input.n();
-		uint32_t batch_size = /*tot_batch_size*/ 129664; // input.n();
-		uint32_t num_batch,
-			last_batch_size;
+		uint32_t batch_size = /*tot_batch_size*/ 64896;
+		uint32_t num_batch, last_batch_size;
 		if (tot_batch_size > batch_size)
 		{
 			num_batch = (tot_batch_size % batch_size == 0) ? tot_batch_size / batch_size : tot_batch_size / batch_size + 1;
@@ -123,105 +125,201 @@ public:
 		uint32_t extra_stride = n_extra_dims() * sizeof(float);
 		uint32_t density_offset, rgb_offset;
 
-		// Stream 1
+		// pipeline depth 3
 		tcnn::GPUMatrixDynamic<T> density_network_input1{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		tcnn::GPUMatrixDynamic<T> density_network_input2{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
 		tcnn::GPUMatrixDynamic<T> density_network_last_input{m_pos_encoding->padded_output_width(), last_batch_size, stream, m_pos_encoding->preferred_output_layout()};
 
-		tcnn::GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		tcnn::GPUMatrixDynamic<T> rgb_network_input1{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		tcnn::GPUMatrixDynamic<T> rgb_network_input2{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
 		tcnn::GPUMatrixDynamic<T> rgb_network_last_input{m_rgb_network_input_width, last_batch_size, stream, m_dir_encoding->preferred_output_layout()};
+
+		auto dir_out1 = rgb_network_input1.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		auto dir_out2 = rgb_network_input2.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		auto dir_last_out = rgb_network_last_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+
+		auto density_network_output1 = rgb_network_input1.slice_rows(0, m_density_network->padded_output_width());
+		auto density_network_output2 = rgb_network_input2.slice_rows(0, m_density_network->padded_output_width());
+		auto density_network_last_output = rgb_network_last_input.slice_rows(0, m_density_network->padded_output_width());
+
 		tcnn::GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), tot_batch_size, output.layout()};
 
-		// First batch ELU
+		// First batch posencoding
 		if (num_batch > 1)
 		{
 			m_pos_encoding->inference_mixed_precision(
-				stream,
+				stream4,
 				input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(0, batch_size),
 				density_network_input1,
 				use_inference_params);
 		}
 		else
 		{ // Only one batch
+			// std::cout << "Not 1" << std::endl;
 			m_pos_encoding->inference_mixed_precision(
-				stream,
+				stream4,
 				input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(0, last_batch_size),
 				density_network_last_input,
 				use_inference_params);
 		}
 
-		for (uint32_t i = 0; i < num_batch - 1; ++i)
+		cudaDeviceSynchronize();
+		// First batch dir_encoding, Second batch pos_encoding
+		if (num_batch > 2)
 		{
-			cudaDeviceSynchronize(); // for sync ELU & MLP
-			// Stream 1
-			// Direction encoding
-			auto dir_out = rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
-			m_dir_encoding->inference_mixed_precision(
-				stream,
-				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols(i * batch_size, batch_size),
-				dir_out,
+			m_pos_encoding->inference_mixed_precision(
+				stream4,
+				input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(batch_size, batch_size),
+				density_network_input2,
 				use_inference_params);
-			auto &density_network_input = (i % 2) ? density_network_input2 : density_network_input1;
-			auto &density_network_copy = (i % 2) ? density_network_input1 : density_network_input2;
 
-			auto density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
-			m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+			m_dir_encoding->inference_mixed_precision(
+				stream2,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols(0, batch_size),
+				dir_out1,
+				use_inference_params);
+
+			m_density_network->inference_mixed_precision(stream3, density_network_input1, density_network_output1, use_inference_params);
+		}
+		else if (num_batch > 1)
+		{ // Only two batch
+			m_pos_encoding->inference_mixed_precision(
+				stream4,
+				input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(batch_size, last_batch_size),
+				density_network_last_input,
+				use_inference_params);
+
+			m_dir_encoding->inference_mixed_precision(
+				stream2,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols(0, batch_size),
+				dir_out1,
+				use_inference_params);
+
+			m_density_network->inference_mixed_precision(stream3, density_network_input1, density_network_output1, use_inference_params);
+		}
+		else
+		{
+			//  Only one batch
+			m_dir_encoding->inference_mixed_precision(
+				stream2,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols(0, last_batch_size),
+				dir_last_out,
+				use_inference_params);
+			m_density_network->inference_mixed_precision(stream3, density_network_last_input, density_network_last_output, use_inference_params);
+		}
+		if (num_batch != 1)
+		{
+			for (uint32_t i = 0; i < num_batch - 2; ++i)
+			{
+				cudaDeviceSynchronize(); // for sync ELU & MLP
+				// Stream 1
+				// Position encoding
+				auto &density_network_input = (i % 2) ? density_network_input1 : density_network_input2;
+				auto &density_network_copy = (i % 2) ? density_network_input2 : density_network_input1;
+				if (i < num_batch - 3)
+				{
+					m_pos_encoding->inference_mixed_precision(
+						stream4,
+						input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(batch_size * (i + 2), batch_size),
+						density_network_copy,
+						use_inference_params);
+				}
+				else
+				{
+					m_pos_encoding->inference_mixed_precision(
+						stream4,
+						input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(batch_size * (i + 2), last_batch_size),
+						density_network_last_input,
+						use_inference_params);
+				}
+				// Stream 2
+				// direction encoding
+
+				auto &dir_out = (i % 2) ? dir_out1 : dir_out2;
+				// auto &dir_copy = (i % 2) ? density_network_input2 : density_network_input1;
+
+				m_dir_encoding->inference_mixed_precision(
+					stream2,
+					input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols((i + 1) * batch_size, batch_size),
+					dir_out,
+					use_inference_params);
+
+				// Stream 3
+				// density network
+				auto &density_network_output = (i % 2) ? density_network_output1 : density_network_output2;
+				auto &extract_density_input = (i % 2) ? density_network_output2 : density_network_output1;
+				m_density_network->inference_mixed_precision(stream3, density_network_input, density_network_output, use_inference_params);
+
+				// Stream 4
+				//  rgb_network + extract_density
+				if (output.layout() == tcnn::AoS) // CM
+				{
+					rgb_offset = padded_output_width() * i * batch_size;
+					density_offset = rgb_offset + 3;
+				}
+				else
+				{
+					rgb_offset = i * batch_size;
+					density_offset = rgb_offset + 3 * tot_batch_size;
+				}
+
+				auto &rgb_network_input = (i % 2) ? rgb_network_input2 : rgb_network_input1;
+				auto rgb_network_output_tmp = rgb_network_output.slice_cols(i * batch_size, batch_size);
+
+				m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output_tmp, use_inference_params);
+
+				tcnn::linear_kernel(extract_density<T>, 0, stream,
+									batch_size,
+									extract_density_input.layout() == tcnn::AoS ? extract_density_input.stride() : 1,
+									output.layout() == tcnn::AoS ? padded_output_width() : 1,
+									extract_density_input.data(),
+									output.data() + density_offset);
+			}
+		}
+		if (num_batch > 1)
+		{
+			// Last-1 stage
+			cudaDeviceSynchronize(); // for sync ELU & MLP
+			// Direction encoding
+			// auto dir_out = rgb_network_last_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+			m_dir_encoding->inference_mixed_precision(
+				stream2,
+				input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols((num_batch - 1) * batch_size, last_batch_size),
+				dir_last_out,
+				use_inference_params);
+
+			// Density MLP
+			// auto density_network_last_output = rgb_network_last_input.slice_rows(0, m_density_network->padded_output_width());
+			auto &extract_density_input = ((num_batch - 2) % 2) ? density_network_output2 : density_network_output1;
+			m_density_network->inference_mixed_precision(stream3, density_network_last_input, density_network_last_output, use_inference_params);
 
 			if (output.layout() == tcnn::AoS)
 			{
-				rgb_offset = padded_output_width() * i * batch_size;
+				rgb_offset = padded_output_width() * (num_batch - 2) * batch_size;
 				density_offset = rgb_offset + 3;
 			}
 			else
 			{
-				rgb_offset = i * batch_size;
+				rgb_offset = (num_batch - 2) * batch_size;
 				density_offset = rgb_offset + 3 * tot_batch_size;
 			}
 
-			auto rgb_network_output_tmp = rgb_network_output.slice_cols(i * batch_size, batch_size);
+			auto &rgb_network_input = ((num_batch - 2) % 2) ? rgb_network_input2 : rgb_network_input1;
+			auto rgb_network_output_tmp = rgb_network_output.slice_cols((num_batch - 2) * batch_size, batch_size);
 
 			m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output_tmp, use_inference_params);
 
 			tcnn::linear_kernel(extract_density<T>, 0, stream,
 								batch_size,
-								density_network_output.layout() == tcnn::AoS ? density_network_output.stride() : 1,
+								extract_density_input.layout() == tcnn::AoS ? extract_density_input.stride() : 1,
 								output.layout() == tcnn::AoS ? padded_output_width() : 1,
-								density_network_output.data(),
+								extract_density_input.data(),
 								output.data() + density_offset);
-
-			// Stream 2
-			if (i < num_batch - 2)
-			{
-				m_pos_encoding->inference_mixed_precision(
-					stream2,
-					input.slice_rows(0, m_pos_encoding->input_width()).slice_cols((i + 1) * batch_size, batch_size),
-					density_network_copy,
-					use_inference_params);
-			}
-			else
-			{
-				m_pos_encoding->inference_mixed_precision(
-					stream2,
-					input.slice_rows(0, m_pos_encoding->input_width()).slice_cols((i + 1) * batch_size, last_batch_size),
-					density_network_last_input,
-					use_inference_params);
-			}
 		}
+		// Last stage
 		cudaDeviceSynchronize(); // for sync ELU & MLP
 
-		// Last batch MLP
-		// Direction encoding
-		auto dir_out = rgb_network_last_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
-		m_dir_encoding->inference_mixed_precision(
-			stream,
-			input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols((num_batch - 1) * batch_size, last_batch_size),
-			dir_out,
-			use_inference_params);
-
-		// Density MLP
-		auto density_network_last_output = rgb_network_last_input.slice_rows(0, m_density_network->padded_output_width());
-		m_density_network->inference_mixed_precision(stream, density_network_last_input, density_network_last_output, use_inference_params);
-
+		// Color MLP
 		if (output.layout() == tcnn::AoS)
 		{
 			rgb_offset = padded_output_width() * (num_batch - 1) * batch_size;
@@ -233,7 +331,6 @@ public:
 			density_offset = rgb_offset + 3 * tot_batch_size;
 		}
 
-		// Color MLP
 		auto rgb_network_output_tmp = rgb_network_output.slice_cols((num_batch - 1) * batch_size, last_batch_size);
 
 		m_rgb_network->inference_mixed_precision(stream, rgb_network_last_input, rgb_network_output_tmp, use_inference_params);
@@ -246,6 +343,154 @@ public:
 							output.data() + density_offset);
 
 		cudaStreamDestroy(stream2);
+		cudaStreamDestroy(stream3);
+		cudaStreamDestroy(stream4);
+		
+		// pipeline depth 2
+		// cudaStream_t stream2; // for SW pipelining
+		// cudaStreamCreate(&stream2);
+		// cudaDeviceSynchronize(); // for sync with previous kernels in stream
+
+		// uint32_t tot_batch_size = input.n();
+		// uint32_t batch_size = /*tot_batch_size*/ 129664; // input.n();
+		// uint32_t num_batch,
+		// 	last_batch_size;
+		// if (tot_batch_size > batch_size)
+		// {
+		// 	num_batch = (tot_batch_size % batch_size == 0) ? tot_batch_size / batch_size : tot_batch_size / batch_size + 1;
+		// 	last_batch_size = tot_batch_size - batch_size * (num_batch - 1);
+		// }
+		// else
+		// {
+		// 	num_batch = 1;
+		// 	last_batch_size = tot_batch_size;
+		// }
+		// uint32_t extra_stride = n_extra_dims() * sizeof(float);
+		// uint32_t density_offset, rgb_offset;
+
+		// // Stream 1
+		// tcnn::GPUMatrixDynamic<T> density_network_input1{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		// tcnn::GPUMatrixDynamic<T> density_network_input2{m_pos_encoding->padded_output_width(), batch_size, stream, m_pos_encoding->preferred_output_layout()};
+		// tcnn::GPUMatrixDynamic<T> density_network_last_input{m_pos_encoding->padded_output_width(), last_batch_size, stream, m_pos_encoding->preferred_output_layout()};
+
+		// tcnn::GPUMatrixDynamic<T> rgb_network_input{m_rgb_network_input_width, batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		// tcnn::GPUMatrixDynamic<T> rgb_network_last_input{m_rgb_network_input_width, last_batch_size, stream, m_dir_encoding->preferred_output_layout()};
+		// tcnn::GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), tot_batch_size, output.layout()};
+
+		// // First batch ELU
+		// if (num_batch > 1)
+		// {
+		// 	m_pos_encoding->inference_mixed_precision(
+		// 		stream,
+		// 		input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(0, batch_size),
+		// 		density_network_input1,
+		// 		use_inference_params);
+		// }
+		// else
+		// { // Only one batch
+		// 	m_pos_encoding->inference_mixed_precision(
+		// 		stream,
+		// 		input.slice_rows(0, m_pos_encoding->input_width()).slice_cols(0, last_batch_size),
+		// 		density_network_last_input,
+		// 		use_inference_params);
+		// }
+
+		// for (uint32_t i = 0; i < num_batch - 1; ++i)
+		// {
+		// 	cudaDeviceSynchronize(); // for sync ELU & MLP
+		// 	// Stream 1
+		// 	// Direction encoding
+		// 	auto dir_out = rgb_network_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		// 	m_dir_encoding->inference_mixed_precision(
+		// 		stream,
+		// 		input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols(i * batch_size, batch_size),
+		// 		dir_out,
+		// 		use_inference_params);
+		// 	auto &density_network_input = (i % 2) ? density_network_input2 : density_network_input1;
+		// 	auto &density_network_copy = (i % 2) ? density_network_input1 : density_network_input2;
+
+		// 	auto density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
+		// 	m_density_network->inference_mixed_precision(stream, density_network_input, density_network_output, use_inference_params);
+
+		// 	if (output.layout() == tcnn::AoS)
+		// 	{
+		// 		rgb_offset = padded_output_width() * i * batch_size;
+		// 		density_offset = rgb_offset + 3;
+		// 	}
+		// 	else
+		// 	{
+		// 		rgb_offset = i * batch_size;
+		// 		density_offset = rgb_offset + 3 * tot_batch_size;
+		// 	}
+
+		// 	auto rgb_network_output_tmp = rgb_network_output.slice_cols(i * batch_size, batch_size);
+
+		// 	m_rgb_network->inference_mixed_precision(stream, rgb_network_input, rgb_network_output_tmp, use_inference_params);
+
+		// 	tcnn::linear_kernel(extract_density<T>, 0, stream,
+		// 						batch_size,
+		// 						density_network_output.layout() == tcnn::AoS ? density_network_output.stride() : 1,
+		// 						output.layout() == tcnn::AoS ? padded_output_width() : 1,
+		// 						density_network_output.data(),
+		// 						output.data() + density_offset);
+
+		// 	// Stream 2
+		// 	if (i < num_batch - 2)
+		// 	{
+		// 		m_pos_encoding->inference_mixed_precision(
+		// 			stream2,
+		// 			input.slice_rows(0, m_pos_encoding->input_width()).slice_cols((i + 1) * batch_size, batch_size),
+		// 			density_network_copy,
+		// 			use_inference_params);
+		// 	}
+		// 	else
+		// 	{
+		// 		m_pos_encoding->inference_mixed_precision(
+		// 			stream2,
+		// 			input.slice_rows(0, m_pos_encoding->input_width()).slice_cols((i + 1) * batch_size, last_batch_size),
+		// 			density_network_last_input,
+		// 			use_inference_params);
+		// 	}
+		// }
+		// cudaDeviceSynchronize(); // for sync ELU & MLP
+
+		// // Last batch MLP
+		// // Direction encoding
+		// auto dir_out = rgb_network_last_input.slice_rows(m_density_network->padded_output_width(), m_dir_encoding->padded_output_width());
+		// m_dir_encoding->inference_mixed_precision(
+		// 	stream,
+		// 	input.slice_rows(m_dir_offset, m_dir_encoding->input_width()).slice_cols((num_batch - 1) * batch_size, last_batch_size),
+		// 	dir_out,
+		// 	use_inference_params);
+
+		// // Density MLP
+		// auto density_network_last_output = rgb_network_last_input.slice_rows(0, m_density_network->padded_output_width());
+		// m_density_network->inference_mixed_precision(stream, density_network_last_input, density_network_last_output, use_inference_params);
+
+		// if (output.layout() == tcnn::AoS)
+		// {
+		// 	rgb_offset = padded_output_width() * (num_batch - 1) * batch_size;
+		// 	density_offset = rgb_offset + 3;
+		// }
+		// else
+		// {
+		// 	rgb_offset = (num_batch - 1) * batch_size;
+		// 	density_offset = rgb_offset + 3 * tot_batch_size;
+		// }
+
+		// // Color MLP
+		// auto rgb_network_output_tmp = rgb_network_output.slice_cols((num_batch - 1) * batch_size, last_batch_size);
+
+		// m_rgb_network->inference_mixed_precision(stream, rgb_network_last_input, rgb_network_output_tmp, use_inference_params);
+
+		// tcnn::linear_kernel(extract_density<T>, 0, stream,
+		// 					last_batch_size,
+		// 					density_network_last_output.layout() == tcnn::AoS ? density_network_last_output.stride() : 1,
+		// 					output.layout() == tcnn::AoS ? padded_output_width() : 1,
+		// 					density_network_last_output.data(),
+		// 					output.data() + density_offset);
+
+		// cudaStreamDestroy(stream2);
 
 		//x pipelining
 		// uint32_t batch_size = input.n();
