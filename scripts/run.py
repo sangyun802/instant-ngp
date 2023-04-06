@@ -238,13 +238,13 @@ if __name__ == "__main__":
 				testbed.render_ground_truth = False
 				image = testbed.render(resolution[0], resolution[1], spp, True)
 
-				if i == 0:
-					write_image(f"ref.png", ref_image)
-					write_image(f"out.png", image)
+				#if i == 0:
+					#write_image(f"ref.png", ref_image)
+					#write_image(f"out.png", image)
 
-					diffimg = np.absolute(image - ref_image)
-					diffimg[...,3:4] = 1.0
-					write_image("diff.png", diffimg)
+					#diffimg = np.absolute(image - ref_image)
+					#diffimg[...,3:4] = 1.0
+					#write_image("diff.png", diffimg)
 
 				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
 				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
