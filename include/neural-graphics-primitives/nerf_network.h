@@ -25,6 +25,7 @@
 #include <tiny-cuda-nn/network.h>
 
 #include <tiny-cuda-nn/network_with_input_encoding.h>
+#include <iostream>
 
 NGP_NAMESPACE_BEGIN
 
@@ -359,7 +360,7 @@ public:
 		cudaDeviceSynchronize(); // for sync with previous kernels in stream
 
 		uint32_t tot_batch_size = input.n();
-		uint32_t batch_size = /*tot_batch_size*/ 16384; // input.n();
+		uint32_t batch_size = /*tot_batch_size*/ 259200; // input.n();
 		uint32_t num_batch,
 			last_batch_size;
 		if (tot_batch_size > batch_size)
@@ -506,7 +507,8 @@ public:
 
 		// tcnn::GPUMatrixDynamic<T> density_network_output = rgb_network_input.slice_rows(0, m_density_network->padded_output_width());
 		// tcnn::GPUMatrixDynamic<T> rgb_network_output{output.data(), m_rgb_network->padded_output_width(), batch_size, output.layout()};
-
+		// // std::cout << m_pos_encoding->padded_output_width() << " "<< m_density_network->padded_output_width() << " "
+		// // << m_rgb_network_input_width << " "<< m_rgb_network->padded_output_width() << " " <<std::endl;
 		// m_pos_encoding->inference_mixed_precision(
 		// 	stream,
 		// 	input.slice_rows(0, m_pos_encoding->input_width()),
